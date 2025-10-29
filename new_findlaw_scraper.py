@@ -46,10 +46,10 @@ def scrape_state(state: str, output_dir: str) -> None:
         for i in range(attempts):
             try:
                 # Add a console logger to see page-side errors in Python logs
-                try:
-                    page.on("console", lambda msg: logging.warning(f"PAGE CONSOLE: {msg.type} :: {msg.text}"))
-                except Exception:
-                    pass
+                # try:
+                #     page.on("console", lambda msg: logging.warning(f"PAGE CONSOLE: {msg.type} :: {msg.text}"))
+                # except Exception:
+                #     pass
                 # 'domcontentloaded' is more reliable for JS-heavy pages than 'load' or 'networkidle'
                 page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 # Wait for a generic body element as a lighter signal the page has painted
@@ -140,7 +140,7 @@ def scrape_state(state: str, output_dir: str) -> None:
         )
 
         context = p.chromium.launch(
-            headless=False,
+            headless=True,
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
         )
         context = context.new_context(
@@ -184,9 +184,7 @@ def scrape_state(state: str, output_dir: str) -> None:
                 section_name = section.get_text(strip=True)
                 section_url = urljoin(state_url, section.get('href'))
                 logging.info(f"Scraping section: {section_name} - {section_url}")
-                if not ("Const" in section_name) and state == "nd":
-                    continue
-
+                
                 if _goto_with_retry(page, section_url, attempts=3):
                     try:
                         scrape_section(
@@ -453,4 +451,4 @@ def fetch_leaf_threadsafe(sec_name, sec_url, path_so_far, lex_path, state, sessi
 
 if __name__ == "__main__":
     # test with ND 
-    scrape_state("nd", DEFAULT_DIR)
+    scrape_state("ky", DEFAULT_DIR)
