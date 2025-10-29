@@ -1,0 +1,4 @@
+2025/10/28-17:18:54.097 29568e0 Reusing MANIFEST /Users/emaanhariri/lab/lawscraper/findlaw_codes/playwright_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2025/10/28-17:18:54.100 29568e0 Recovering log #3
+2025/10/28-17:18:54.100 29568e0 (ignoring error) /Users/emaanhariri/lab/lawscraper/findlaw_codes/playwright_profile/Default/Local Storage/leveldb/000003.log: dropping 1069 bytes; Corruption: checksum mismatch
+2025/10/28-17:18:54.100 29568e0 Reusing old log /Users/emaanhariri/lab/lawscraper/findlaw_codes/playwright_profile/Default/Local Storage/leveldb/000003.log 
