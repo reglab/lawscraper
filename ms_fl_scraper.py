@@ -41,7 +41,8 @@ def _chunk_list(seq, n):
             yield seq[start:end]
         start = end
 
-def _worker_scrape_sections(state: str, code_title: str, state_url: str, sections_slice: list, output_part_path: str):
+def _worker_scrape_sections(state: str, code_title: str, state_url: str, sections_slice: list, output_part_path: str, progress_queue=None, record_queue=None):
+    # Worker runs without rendering tqdm bars; parent process owns console progress output
     """
     Worker process: launches its own Playwright browser and threadpool, scrapes only the given sections.
     `sections_slice` is a list of dicts: {"idx": int, "name": str, "url": str}
@@ -53,7 +54,7 @@ def _worker_scrape_sections(state: str, code_title: str, state_url: str, section
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
     # leaf HTTP session for this process
-    MAX_WORKERS = 16
+    MAX_WORKERS = 8
     leaf_session = requests.Session()
     leaf_session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -79,7 +80,7 @@ def _worker_scrape_sections(state: str, code_title: str, state_url: str, section
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
+            headless=True,
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
         )
         context = browser.new_context(
@@ -100,48 +101,54 @@ def _worker_scrape_sections(state: str, code_title: str, state_url: str, section
         """
         page.add_init_script(stealth_js)
 
-        with open(output_part_path, "w", encoding="utf-8") as fout:
-            for s in sections_slice:
-                section_name = s["name"]
-                section_url = s["url"]
-                idx = s["idx"]
-                logging.info(f"[pid={os.getpid()}] Scraping section: {section_name} - {section_url}")
-                # lightweight retry nav
-                ok = False
-                for attempt in range(3):
-                    try:
-                        page.goto(section_url, timeout=60000, wait_until="domcontentloaded")
-                        page.wait_for_selector("body", timeout=15000)
-                        ok = True
-                        break
-                    except PlaywrightTimeoutError:
-                        logging.warning(f"[pid={os.getpid()}] Timeout loading {section_url} (attempt {attempt+1}/3)")
-                        try:
-                            page.reload(timeout=30000, wait_until="domcontentloaded")
-                        except Exception:
-                            pass
-                        time.sleep(2 * (attempt + 1))
-                    except Exception as e:
-                        logging.warning(f"[pid={os.getpid()}] Navigation error: {e}")
-                        time.sleep(2 * (attempt + 1))
-                if not ok:
-                    continue
-
+        for s in sections_slice:
+            section_name = s["name"]
+            section_url = s["url"]
+            idx = s["idx"]
+            logging.info(f"[pid={os.getpid()}] Scraping section: {section_name} - {section_url}")
+            # lightweight retry nav
+            ok = False
+            for attempt in range(3):
                 try:
-                    scrape_section(
-                        page, state, section_name, section_url,
-                        [code_title, section_name], [idx+1], fout,
-                        parallel=True, executor=executor, session=leaf_session, futures=futures,
-                        return_work=False
-                    )
+                    page.goto(section_url, timeout=60000, wait_until="domcontentloaded")
+                    page.wait_for_selector("body", timeout=15000)
+                    ok = True
+                    break
+                except PlaywrightTimeoutError:
+                    logging.warning(f"[pid={os.getpid()}] Timeout loading {section_url} (attempt {attempt+1}/3)")
+                    try:
+                        page.reload(timeout=30000, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
+                    time.sleep(2 * (attempt + 1))
                 except Exception as e:
-                    logging.error(f"[pid={os.getpid()}] Error while scraping section {section_name}: {e}")
+                    logging.warning(f"[pid={os.getpid()}] Navigation error: {e}")
+                    time.sleep(2 * (attempt + 1))
+            if not ok:
+                continue
 
-            # drain futures
-            if futures:
-                for _ in as_completed(futures):
+            try:
+                scrape_section(
+                    page, state, section_name, section_url,
+                    [code_title, section_name], [idx+1], None,
+                    parallel=True, executor=executor, session=leaf_session, futures=futures,
+                    return_work=False, tqdm_position=0, tqdm_disable=True, record_queue=record_queue
+                )
+                # notify parent that this section finished scheduling
+                try:
+                    if progress_queue is not None:
+                        progress_queue.put(1)
+                except Exception:
                     pass
-            executor.shutdown(wait=True)
+                # workers do not report progress directly; parent updates on future completion
+            except Exception as e:
+                logging.error(f"[pid={os.getpid()}] Error while scraping section {section_name}: {e}")
+
+        # drain futures
+        if futures:
+            for _ in as_completed(futures):
+                pass
+        executor.shutdown(wait=True)
         context.close()
         browser.close()
 
@@ -226,7 +233,7 @@ def scrape_state(state: str, output_dir: str) -> None:
     output_file = os.path.join(output_dir, f"{state.upper()}.jsonl")
 
     # Global executor and session (producer → consumer streaming)
-    MAX_WORKERS = 16  # tune 8–12 for this host
+    MAX_WORKERS = 12  # tune 8–12 for this host
     leaf_session = requests.Session()
     leaf_session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -279,7 +286,10 @@ def scrape_state(state: str, output_dir: str) -> None:
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
             """
             page.add_init_script(stealth_js)
-
+            
+            from tqdm import tqdm
+            sections_bar = tqdm(total=len(sections), desc="Sections", unit="section",
+                                dynamic_ncols=True, position=0, leave=True)
             with open(output_file, 'w', encoding='utf-8') as f_out:
                 for idx, section in enumerate(sections):
                     section_name = section.get_text(strip=True)
@@ -291,12 +301,14 @@ def scrape_state(state: str, output_dir: str) -> None:
                                 page, state, section_name, section_url,
                                 [code_title, section_name], [idx+1], f_out,
                                 parallel=True, executor=executor, session=leaf_session, futures=all_futures,
-                                return_work=False
+                                return_work=False, tqdm_position=1
                             )
+                            sections_bar.update(1)
                         except Exception as e:
                             logging.error(f"Error while scraping section {section_name}: {e}")
                     else:
                         continue
+                sections_bar.close()
 
                 if all_futures:
                     from concurrent.futures import as_completed
@@ -315,35 +327,78 @@ def scrape_state(state: str, output_dir: str) -> None:
             if not href:
                 continue
             sections_info.append({"idx": idx, "name": name, "url": urljoin(state_url, href)})
+        
+        from tqdm import tqdm
+        sections_bar = tqdm(total=len(sections_info), desc="Sections", unit="section",
+                            dynamic_ncols=True, position=0, leave=True)
+        # Create queues and writer thread for single-file output
+        from queue import Empty
+        from threading import Thread
 
         # Cap processes to number of sections
         proc_count = min(MAX_BROWSERS, max(1, len(sections_info)))
-        parts = []
+        # Improve perceived progress by splitting into more chunks than processes
+        chunk_factor = max(1, int(os.environ.get("FINDLAW_CHUNKS_PER_PROC", "4")))
+        total_chunks = min(len(sections_info), proc_count * chunk_factor)
         ctx = get_context("spawn")
-        with ProcessPoolExecutor(max_workers=proc_count, mp_context=ctx) as pool:
-            futures = []
-            for pi, chunk in enumerate(_chunk_list(sections_info, proc_count)):
-                part_path = os.path.join(output_dir, f"{state.upper()}.part{pi}.jsonl")
-                parts.append(part_path)
-                futures.append(pool.submit(_worker_scrape_sections, state, code_title, state_url, chunk, part_path))
-            # wait for all workers
-            for _ in as_completed(futures):
-                pass
-
-        # Merge part files into the final output
-        with open(output_file, "w", encoding="utf-8") as fout:
-            for part in parts:
-                try:
-                    with open(part, "r", encoding="utf-8") as fin:
-                        for line in fin:
-                            fout.write(line)
-                except FileNotFoundError:
-                    continue
-                finally:
+        manager = ctx.Manager()
+        progress_q = manager.Queue(maxsize=1000)
+        record_q = manager.Queue(maxsize=10000)
+        # Writer thread
+        def _writer():
+            with open(output_file, 'w', encoding='utf-8') as fout:
+                while True:
+                    item = record_q.get()
+                    if item is None:
+                        break
                     try:
-                        os.remove(part)
+                        fout.write(item)
                     except Exception:
                         pass
+        writer_t = Thread(target=_writer, daemon=True)
+        writer_t.start()
+
+        with ProcessPoolExecutor(max_workers=proc_count, mp_context=ctx) as pool:
+            futures = []
+            for pi, chunk in enumerate(_chunk_list(sections_info, total_chunks)):
+                # part_path kept for arg shape but unused in worker when record_queue is provided
+                fut = pool.submit(_worker_scrape_sections, state, code_title, state_url, chunk, "", progress_q, record_q)
+                futures.append(fut)
+            # Drain per-section progress from queue while workers run
+            total_expected = len(sections_info)
+            processed = 0
+            done_workers = 0
+            total_workers = len(futures)
+            while processed < total_expected and done_workers < total_workers:
+                try:
+                    inc = progress_q.get(timeout=0.5)
+                    if isinstance(inc, int) and inc > 0:
+                        sections_bar.update(inc)
+                        processed += inc
+                except Empty:
+                    pass
+                # update done_workers snapshot
+                done_workers = sum(1 for f in futures if f.done())
+            # Drain any remaining queued increments without blocking
+            try:
+                while True:
+                    inc = progress_q.get_nowait()
+                    if isinstance(inc, int) and inc > 0:
+                        sections_bar.update(inc)
+                        processed += inc
+            except Empty:
+                pass
+            # Ensure all workers have completed
+            for fut in as_completed(futures):
+                fut.result()
+        # stop writer
+        record_q.put(None)
+        writer_t.join()
+        try:
+            manager.shutdown()
+        except Exception:
+            pass
+        sections_bar.close()
 
 
 
@@ -366,8 +421,7 @@ def _wait_links_or_subaccordions(scope, timeout=6000):
     except Exception:
         return False
 
-def scrape_section(page: Page, state: str, code_name: str, section_url: str, path_so_far: List[str], lex_order: List[int], f_out,
-                  parallel: bool = True, executor=None, session=None, futures=None, return_work: bool = False):
+def scrape_section(page: Page, state: str, code_name: str, section_url: str, path_so_far: List[str], lex_order: List[int], f_out, parallel: bool = True, executor=None, session=None, futures=None, return_work: bool = False, tqdm_position: int = 0, tqdm_disable: bool = False, record_queue=None):
     """
     Scrape a specific section of law from FindLaw.
 
@@ -486,7 +540,15 @@ def scrape_section(page: Page, state: str, code_name: str, section_url: str, pat
         if executor is None or session is None or futures is None:
             raise RuntimeError("Parallel mode requires shared executor, session, and futures list.")
 
-        section_bar = tqdm(total=len(work), desc=f"{code_name} - leaves", unit="leaf", dynamic_ncols=True)
+        section_bar = tqdm(
+                        total=len(work),
+                        desc=f"{code_name} - leaves",
+                        unit="leaf",
+                        dynamic_ncols=True,
+                        position=tqdm_position if tqdm_position is not None else 0,
+                        leave=False,
+                        disable=tqdm_disable
+                    )
         from threading import Lock
         _bar_lock = Lock()
 
@@ -506,12 +568,20 @@ def scrape_section(page: Page, state: str, code_name: str, section_url: str, pat
         done_cb = _mk_done_cb(section_bar)
 
         for (sec, url, p, lp) in work:
-            fut = executor.submit(fetch_leaf_threadsafe, sec, url, p, lp, state, session, f_out)
+            fut = executor.submit(fetch_leaf_threadsafe, sec, url, p, lp, state, session, f_out, record_queue)
             fut.add_done_callback(done_cb)
             futures.append(fut)
     else:
         total_leaves = len(work)
-        bar = tqdm(total=total_leaves, desc=f"{code_name} - leaves", unit="leaf", dynamic_ncols=True)
+        bar = tqdm(
+                    total=total_leaves,
+                    desc=f"{code_name} - leaves",
+                    unit="leaf",
+                    dynamic_ncols=True,
+                    position=tqdm_position if tqdm_position is not None else 0,
+                    leave=False,
+                    disable=tqdm_disable
+                )
         for (sec, url, p, lp) in work:
             scrape_leaf(page, state, sec, url, p, lp, f_out)
             bar.update(1)
@@ -564,7 +634,7 @@ import requests, time, random
 
 WRITE_LOCK = Lock()
 
-def fetch_leaf_threadsafe(sec_name, sec_url, path_so_far, lex_path, state, session, f_out):
+def fetch_leaf_threadsafe(sec_name, sec_url, path_so_far, lex_path, state, session, f_out, record_queue=None):
     # light retry with backoff
     for attempt in range(4):
         try:
@@ -583,9 +653,14 @@ def fetch_leaf_threadsafe(sec_name, sec_url, path_so_far, lex_path, state, sessi
                     "content": content_div,
                     "lex_path": lex_path,
                 }
-                with WRITE_LOCK:
-                    import json
-                    f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
+                import json
+                line = json.dumps(data, ensure_ascii=False)
+                if record_queue is not None:
+                    # Send to parent writer thread
+                    record_queue.put(line + "\n")
+                else:
+                    with WRITE_LOCK:
+                        f_out.write(line + "\n")
                 return
             time.sleep(1.5 * (attempt + 1))
         except requests.RequestException:
@@ -595,4 +670,4 @@ def fetch_leaf_threadsafe(sec_name, sec_url, path_so_far, lex_path, state, sessi
 
 if __name__ == "__main__":
     # test with ND 
-    scrape_state("pa", DEFAULT_DIR)
+    scrape_state("nd", DEFAULT_DIR)
