@@ -20,11 +20,130 @@ from typing import List, Dict, Optional
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 
 FL_BASE_URL = "https://codes.findlaw.com/{state}"
 MISSING_STATES = ["nd", "ky", "pa"]
 
 DEFAULT_DIR = "findlaw_codes" # Directory to save the scraped data, e.g. findlaw_codes/ND.jsonl
+
+def _chunk_list(seq, n):
+    """Yield n contiguous chunks from seq (as balanced as possible)."""
+    if n <= 1 or len(seq) == 0:
+        yield seq
+        return
+    k, m = divmod(len(seq), n)
+    start = 0
+    for i in range(n):
+        end = start + k + (1 if i < m else 0)
+        if start < end:
+            yield seq[start:end]
+        start = end
+
+def _worker_scrape_sections(state: str, code_title: str, state_url: str, sections_slice: list, output_part_path: str):
+    """
+    Worker process: launches its own Playwright browser and threadpool, scrapes only the given sections.
+    `sections_slice` is a list of dicts: {"idx": int, "name": str, "url": str}
+    Writes JSONL lines into `output_part_path`.
+    """
+    import json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from urllib.parse import urljoin
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+    # leaf HTTP session for this process
+    MAX_WORKERS = 16
+    leaf_session = requests.Session()
+    leaf_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
+    })
+    adapter = HTTPAdapter(
+        pool_connections=MAX_WORKERS * 2,
+        pool_maxsize=MAX_WORKERS,
+        max_retries=Retry(
+            total=5,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=False,
+        ),
+    )
+    leaf_session.mount("https://", adapter)
+    leaf_session.mount("http://", adapter)
+
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    futures = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            locale="en-US",
+            timezone_id="America/Chicago",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        page = context.new_page()
+        page.wait_for_timeout(200)
+        stealth_js = """
+        Object.defineProperty(navigator, 'webdriver', {get: () => false});
+        window.navigator.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        """
+        page.add_init_script(stealth_js)
+
+        with open(output_part_path, "w", encoding="utf-8") as fout:
+            for s in sections_slice:
+                section_name = s["name"]
+                section_url = s["url"]
+                idx = s["idx"]
+                logging.info(f"[pid={os.getpid()}] Scraping section: {section_name} - {section_url}")
+                # lightweight retry nav
+                ok = False
+                for attempt in range(3):
+                    try:
+                        page.goto(section_url, timeout=60000, wait_until="domcontentloaded")
+                        page.wait_for_selector("body", timeout=15000)
+                        ok = True
+                        break
+                    except PlaywrightTimeoutError:
+                        logging.warning(f"[pid={os.getpid()}] Timeout loading {section_url} (attempt {attempt+1}/3)")
+                        try:
+                            page.reload(timeout=30000, wait_until="domcontentloaded")
+                        except Exception:
+                            pass
+                        time.sleep(2 * (attempt + 1))
+                    except Exception as e:
+                        logging.warning(f"[pid={os.getpid()}] Navigation error: {e}")
+                        time.sleep(2 * (attempt + 1))
+                if not ok:
+                    continue
+
+                try:
+                    scrape_section(
+                        page, state, section_name, section_url,
+                        [code_title, section_name], [idx+1], fout,
+                        parallel=True, executor=executor, session=leaf_session, futures=futures,
+                        return_work=False
+                    )
+                except Exception as e:
+                    logging.error(f"[pid={os.getpid()}] Error while scraping section {section_name}: {e}")
+
+            # drain futures
+            if futures:
+                for _ in as_completed(futures):
+                    pass
+            executor.shutdown(wait=True)
+        context.close()
+        browser.close()
 
 def scrape_state(state: str, output_dir: str) -> None:
     """
@@ -131,84 +250,100 @@ def scrape_state(state: str, output_dir: str) -> None:
     from concurrent.futures import ThreadPoolExecutor
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     all_futures = []
+    MAX_BROWSERS = int(os.environ.get("FINDLAW_MAX_BROWSERS", "1"))
 
-    with sync_playwright() as p:
-        # Disable persistent profile to rule out corrupted profile state
-        user_agent = (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+    if MAX_BROWSERS <= 1:
+        # === single-browser path (existing behavior) ===
+        with sync_playwright() as p:
+            user_agent = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            browser = p.chromium.launch(
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1366, "height": 768},
+                user_agent=user_agent,
+                locale="en-US",
+                timezone_id="America/Chicago",
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            page = context.new_page()
+            page.wait_for_timeout(300)
+            stealth_js = """
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            window.navigator.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            """
+            page.add_init_script(stealth_js)
 
-        context = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = context.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent=user_agent,
-            locale="en-US",
-            timezone_id="America/Chicago",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        )
+            with open(output_file, 'w', encoding='utf-8') as f_out:
+                for idx, section in enumerate(sections):
+                    section_name = section.get_text(strip=True)
+                    section_url = urljoin(state_url, section.get('href'))
+                    logging.info(f"Scraping section: {section_name} - {section_url}")
+                    if _goto_with_retry(page, section_url, attempts=3):
+                        try:
+                            scrape_section(
+                                page, state, section_name, section_url,
+                                [code_title, section_name], [idx+1], f_out,
+                                parallel=True, executor=executor, session=leaf_session, futures=all_futures,
+                                return_work=False
+                            )
+                        except Exception as e:
+                            logging.error(f"Error while scraping section {section_name}: {e}")
+                    else:
+                        continue
 
-        page = context.new_page()
+                if all_futures:
+                    from concurrent.futures import as_completed
+                    for _ in as_completed(all_futures):
+                        pass
+                executor.shutdown(wait=True)
+            context.close()
+            browser.close()
+    else:
+        # === multi-browser path (N processes, each with its own browser) ===
+        # Precompute the sections list we’ll distribute to workers
+        sections_info = []
+        for idx, section in enumerate(sections):
+            name = section.get_text(strip=True)
+            href = section.get('href')
+            if not href:
+                continue
+            sections_info.append({"idx": idx, "name": name, "url": urljoin(state_url, href)})
 
-        # Add a very short unconditional wait to let extensions/flags settle
-        page.wait_for_timeout(300)
+        # Cap processes to number of sections
+        proc_count = min(MAX_BROWSERS, max(1, len(sections_info)))
+        parts = []
+        ctx = get_context("spawn")
+        with ProcessPoolExecutor(max_workers=proc_count, mp_context=ctx) as pool:
+            futures = []
+            for pi, chunk in enumerate(_chunk_list(sections_info, proc_count)):
+                part_path = os.path.join(output_dir, f"{state.upper()}.part{pi}.jsonl")
+                parts.append(part_path)
+                futures.append(pool.submit(_worker_scrape_sections, state, code_title, state_url, chunk, part_path))
+            # wait for all workers
+            for _ in as_completed(futures):
+                pass
 
-        # Add a small stealth script to make navigator properties look more like a real Chrome browser.
-        stealth_js = """
-        Object.defineProperty(navigator, 'webdriver', {get: () => false});
-        window.navigator.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-        """
-        page.add_init_script(stealth_js)
-
-        # Block heavy third-party resources but allow FindLaw-owned images/fonts/media
-        """
-        def _route_handler(route, request):
-            url = request.url.lower()
-            # Allow assets from FindLaw so icons, fonts, and site media load correctly.
-            if request.resource_type in ("image", "media", "font"):
-                if "findlaw.com" in url or "codes.findlaw.com" in url:
-                    return route.continue_()
-                return route.abort()
-            return route.continue_()
-
-        page.route("**/*", _route_handler)
-        """
-
-        with open(output_file, 'w', encoding='utf-8') as f_out:
-            for idx, section in enumerate(sections):
-                section_name = section.get_text(strip=True)
-                section_url = urljoin(state_url, section.get('href'))
-                logging.info(f"Scraping section: {section_name} - {section_url}")
-                # if "Title 30" not in section_name: 
-                #     continue
-                
-                if _goto_with_retry(page, section_url, attempts=3):
-                    try:
-                        scrape_section(
-                            page, state, section_name, section_url,
-                            [code_title, section_name], [idx+1], f_out,
-                            parallel=True, executor=executor, session=leaf_session, futures=all_futures,
-                            return_work=False
-                        )
-                    except Exception as e:
-                        logging.error(f"Error while scraping section {section_name}: {e}")
-                else:
-                    # Skip this section after repeated timeouts
+        # Merge part files into the final output
+        with open(output_file, "w", encoding="utf-8") as fout:
+            for part in parts:
+                try:
+                    with open(part, "r", encoding="utf-8") as fin:
+                        for line in fin:
+                            fout.write(line)
+                except FileNotFoundError:
                     continue
-
-            # Join all futures now
-            if all_futures:
-                from concurrent.futures import as_completed
-                for _ in as_completed(all_futures):
-                    pass
-
-            executor.shutdown(wait=True)
-        context.close()
+                finally:
+                    try:
+                        os.remove(part)
+                    except Exception:
+                        pass
 
 
 
