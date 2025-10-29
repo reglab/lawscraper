@@ -184,8 +184,8 @@ def scrape_state(state: str, output_dir: str) -> None:
                 section_name = section.get_text(strip=True)
                 section_url = urljoin(state_url, section.get('href'))
                 logging.info(f"Scraping section: {section_name} - {section_url}")
-                if "Title 30" not in section_name: 
-                    continue
+                # if "Title 30" not in section_name: 
+                #     continue
                 
                 if _goto_with_retry(page, section_url, attempts=3):
                     try:
@@ -211,20 +211,20 @@ def scrape_state(state: str, output_dir: str) -> None:
         context.close()
 
 
-def _wait_accordion_ready(scope, timeout=12000):
+
+def _wait_links_or_subaccordions(scope, timeout=6000):
     """
-    Wait until an accordion panel under `scope` has either:
-      - at least one link (leaf), or
-      - at least one nested accordion item.
-    Keeps code minimal and avoids over-waiting on skeletons.
-    Returns True if something attached, False on soft-timeout.
+    Wait (briefly) for either links (leaves) or nested accordion-items to appear under `scope`.
+    Returns True if something is present/attaches, False on soft-timeout.
     """
-    # ensure its content is visible if present
+    sel = ".fl-recursive-tree-accordion a[href], .fl-recursive-tree-accordion-list .fl-accordion .fl-accordion-item"
+    # fast path: anything already there?
     try:
-        scope.locator(".fl-accordion-content").wait_for(state="visible", timeout=timeout)
+        if scope.locator(sel).count() > 0:
+            return True
     except Exception:
         pass
-    sel = ".fl-recursive-tree-accordion a[href], .fl-recursive-tree-accordion-list .fl-accordion .fl-accordion-item"
+    # slow path: wait briefly for first match to attach
     try:
         scope.locator(sel).first.wait_for(state="attached", timeout=timeout)
         return True
@@ -251,16 +251,18 @@ def scrape_section(page: Page, state: str, code_name: str, section_url: str, pat
         """DFS over any number of accordion layers; collect (sec_name, url, path, lex)."""
         results = []
 
-        # Ensure something has loaded under this scope (links or more accordions)
-        _wait_accordion_ready(scope, 15000)
+        # If nothing is present yet, wait briefly for either links or nested accordions.
+        if scope.locator(".fl-recursive-tree-accordion a[href], .fl-recursive-tree-accordion-list .fl-accordion .fl-accordion-item").count() == 0:
+            _wait_links_or_subaccordions(scope, timeout=6000)
 
         # Case A: links directly under this scope
         link_list = scope.locator(".fl-recursive-tree-accordion a[href]")
+        direct_count = 0
         try:
-            link_list.first.wait_for(state="attached", timeout=6000)
+            direct_count = link_list.count()
         except Exception:
-            pass
-        direct_count = link_list.count()
+            direct_count = 0
+
         if direct_count > 0:
             for k in range(direct_count):
                 a = link_list.nth(k)
@@ -274,25 +276,32 @@ def scrape_section(page: Page, state: str, code_name: str, section_url: str, pat
 
         # Case B: deeper accordions under this scope
         nested_items = scope.locator(".fl-recursive-tree-accordion-list .fl-accordion .fl-accordion-item")
-        nested_count = nested_items.count()
+        nested_count = 0
+        try:
+            nested_count = nested_items.count()
+        except Exception:
+            nested_count = 0
+
         for j in range(nested_count):
             n_item = nested_items.nth(j)
             n_btn = n_item.locator("button.fl-accordion-button")
             try:
-                n_btn.wait_for(state="attached", timeout=8000)
+                n_btn.wait_for(state="attached", timeout=3000)
             except Exception:
                 continue
 
             # label for this node
             try:
-                label = n_btn.locator(".fl-text-left").inner_text(timeout=3000).strip()
+                label = n_btn.locator(".fl-text-left").inner_text(timeout=2000).strip()
             except Exception:
                 label = f"Section {j+1}"
 
             # expand if collapsed
             if (n_btn.get_attribute("aria-expanded") or "").lower() != "true":
-                n_btn.click()
-                n_item.locator(".fl-accordion-content").wait_for(state="visible", timeout=15000)
+                n_btn.evaluate("el => el.click()")
+
+            # After expanding, wait briefly for content under this node to show up (links or more accordions)
+            _wait_links_or_subaccordions(n_item, timeout=6000)
 
             # Recurse
             results.extend(
@@ -320,7 +329,8 @@ def scrape_section(page: Page, state: str, code_name: str, section_url: str, pat
         # Expand if needed
         if (btn.get_attribute("aria-expanded") or "").lower() != "true":
             btn.click()
-            item.locator(".fl-accordion-content").wait_for(state="visible", timeout=15000)
+        # After expanding, wait briefly for either links or nested items under this top-level
+        _wait_links_or_subaccordions(item, timeout=6000)
 
         # Collect all links at any depth under this top-level item
         work.extend(
@@ -450,4 +460,4 @@ def fetch_leaf_threadsafe(sec_name, sec_url, path_so_far, lex_path, state, sessi
 
 if __name__ == "__main__":
     # test with ND 
-    scrape_state("pa", DEFAULT_DIR)
+    scrape_state("ky", DEFAULT_DIR)
