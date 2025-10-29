@@ -9,14 +9,8 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-from scraper_utils import (
-    CODES_BASE_URL,
-    FAILED_FAILPATH,
-    HEADERS,
-    JUR_URL_MAP,
-    JUSTIA_BASE_URL,
-    REGULATIONS_BASE_URL,
-)
+from scraper_utils import (CODES_BASE_URL, FAILED_FAILPATH, HEADERS,
+                           JUR_URL_MAP, JUSTIA_BASE_URL, REGULATIONS_BASE_URL)
 
 # Queue to send progress updates from worker threads to the main thread
 progress_queue = queue.Queue()
@@ -314,13 +308,20 @@ def process_states_in_parallel(
         for state in states
     }
     progress_bars["finished_states"] = tqdm(
-        desc=f"Finished States (0/{n}):", total=0, position=0, dynamic_ncols=True, smoothing=0
+        desc=f"Finished States (0/{n}):",
+        total=0,
+        position=0,
+        dynamic_ncols=True,
+        smoothing=0,
     )
     state_progress = {
         state: {"completed": 0, "failed": 0, "last": ""} for state in states
     }
     finished_states, available_pos = [], set(
-        range(len(states) + 1, len(states) + (len(remaining_states) if remaining_states else 0) + 1)
+        range(
+            len(states) + 1,
+            len(states) + (len(remaining_states) if remaining_states else 0) + 1,
+        )
     )
 
     # Main loop for updating progress bars
@@ -342,7 +343,7 @@ def process_states_in_parallel(
             elif status.startswith("last:"):
                 # 5 is for the "last:" at the beginning of the string
                 # 29 or 38 is for the url up to the state name
-                state_progress[state_name]["last"] = status[43 if regs else 34:]
+                state_progress[state_name]["last"] = status[43 if regs else 34 :]
             elif status == "finished":
                 finished_states.append(state_name)
                 progress_bars["finished_states"].set_description(

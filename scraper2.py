@@ -7,14 +7,8 @@ import requests
 from bs4 import BeautifulSoup, PageElement
 from tqdm import tqdm
 
-from scraper_utils import (
-    CODES_BASE_URL,
-    FAILED_FAILPATH,
-    HEADERS,
-    JUR_URL_MAP,
-    JUSTIA_BASE_URL,
-    REGULATIONS_BASE_URL,
-)
+from scraper_utils import (CODES_BASE_URL, FAILED_FAILPATH, HEADERS,
+                           JUR_URL_MAP, JUSTIA_BASE_URL, REGULATIONS_BASE_URL)
 
 
 def extract_links_from_content(content: PageElement) -> list:
@@ -201,9 +195,7 @@ def collect_leaf_urls(
 
                 collected_urls.append(url)
                 print(url)
-                process_code_leaf(
-                    state_name, url, jsonl_fp, regs, lex_path=path
-                )
+                process_code_leaf(state_name, url, jsonl_fp, regs, lex_path=path)
         else:
             print(
                 f"Failed to retrieve content for {url}, Status Code: {response.status_code}"

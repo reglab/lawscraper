@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-import os
 import glob
+import os
 from collections import defaultdict
+
 
 def merge_jsonl_parts_in_directory(directory: str):
     part_files = glob.glob(os.path.join(directory, "*.part*.jsonl"))
@@ -25,10 +26,12 @@ def merge_jsonl_parts_in_directory(directory: str):
                         outfile.write(line)
         print(f"Merged {len(files)} parts into {merged_path}")
 
+
 def main():
     # This line makes it look in the same directory as this script file:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     merge_jsonl_parts_in_directory(current_dir)
+
 
 if __name__ == "__main__":
     main()

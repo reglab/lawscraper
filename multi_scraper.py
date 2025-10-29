@@ -9,14 +9,8 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-from scraper_utils import (
-    CODES_BASE_URL,
-    FAILED_FAILPATH,
-    HEADERS,
-    JUR_URL_MAP,
-    JUSTIA_BASE_URL,
-    REGULATIONS_BASE_URL,
-)
+from scraper_utils import (CODES_BASE_URL, FAILED_FAILPATH, HEADERS,
+                           JUR_URL_MAP, JUSTIA_BASE_URL, REGULATIONS_BASE_URL)
 
 # Queue to send progress updates from worker threads to the main thread
 progress_queue = queue.Queue()

@@ -10,14 +10,8 @@ import requests
 from bs4 import BeautifulSoup, PageElement
 from tqdm import tqdm
 
-from scraper_utils import (
-    CODES_BASE_URL,
-    FAILED_FAILPATH,
-    HEADERS,
-    JUR_URL_MAP,
-    JUSTIA_BASE_URL,
-    REGULATIONS_BASE_URL,
-)
+from scraper_utils import (CODES_BASE_URL, FAILED_FAILPATH, HEADERS,
+                           JUR_URL_MAP, JUSTIA_BASE_URL, REGULATIONS_BASE_URL)
 
 
 def extract_links_from_content(content: PageElement) -> list:
@@ -291,7 +285,7 @@ def collect_codes_for_state(
         if not internal_links_element:
             print(f"No top-level branches found for {state_name}")
             return
-        
+
         links = extract_links_from_content(internal_links_element)
         print(f"Found {len(links)} top-level titles to scrape for {state_name}.")
 
