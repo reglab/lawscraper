@@ -56,6 +56,7 @@ def _worker_scrape_sections(
     output_part_path: str,
     progress_queue=None,
     record_queue=None,
+    threads: int = 4,
 ):
     # Worker runs without rendering tqdm bars; parent process owns console progress output
     """
@@ -71,7 +72,7 @@ def _worker_scrape_sections(
     from playwright.sync_api import sync_playwright
 
     # leaf HTTP session for this process
-    MAX_WORKERS = 8
+    MAX_WORKERS = max(1, int(threads))
     leaf_session = requests.Session()
     leaf_session.headers.update(
         {
@@ -195,7 +196,7 @@ def _worker_scrape_sections(
         browser.close()
 
 
-def scrape_state(state: str, output_dir: str) -> None:
+def scrape_state(state: str, output_dir: str, *, processes: int = 6, threads: int = 8, chunks_per_proc: int = 4) -> None:
     """
     Scrape statutes for a given state from FindLaw and save them to a JSONL file.
 
@@ -245,9 +246,10 @@ def scrape_state(state: str, output_dir: str) -> None:
         return False
 
     state = state.lower()
-    if state not in MISSING_STATES:
+    FL_STATES = ["al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia", "ks", "la", "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nj", "nm", "ny", "nc", "nd", "oh", "or", "pa", "ri", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy"]
+    if state not in FL_STATES:
         raise ValueError(
-            f"State {state} is not in the list of missing states: {MISSING_STATES}"
+            f"State {state} is not in the list of FindLaw states: {FL_STATES}"
         )
 
     state_url = FL_BASE_URL.format(state=state)
@@ -289,7 +291,7 @@ def scrape_state(state: str, output_dir: str) -> None:
     output_file = os.path.join(output_dir, f"{state.upper()}.jsonl")
 
     # Global executor and session (producer → consumer streaming)
-    MAX_WORKERS = 12  # tune 8–12 for this host
+    MAX_WORKERS = max(1, int(threads))
     leaf_session = requests.Session()
     leaf_session.headers.update(
         {
@@ -316,7 +318,7 @@ def scrape_state(state: str, output_dir: str) -> None:
 
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     all_futures = []
-    MAX_BROWSERS = int(os.environ.get("FINDLAW_MAX_BROWSERS", "1"))
+    MAX_BROWSERS = max(1, int(processes))
 
     if MAX_BROWSERS <= 1:
         # === single-browser path (existing behavior) ===
@@ -392,8 +394,6 @@ def scrape_state(state: str, output_dir: str) -> None:
                 sections_bar.close()
 
                 if all_futures:
-                    from concurrent.futures import as_completed
-
                     for _ in as_completed(all_futures):
                         pass
                 executor.shutdown(wait=True)
@@ -425,11 +425,10 @@ def scrape_state(state: str, output_dir: str) -> None:
         # Create queues and writer thread for single-file output
         from queue import Empty
         from threading import Thread
-
         # Cap processes to number of sections
         proc_count = min(MAX_BROWSERS, max(1, len(sections_info)))
         # Improve perceived progress by splitting into more chunks than processes
-        chunk_factor = max(1, int(os.environ.get("FINDLAW_CHUNKS_PER_PROC", "4")))
+        chunk_factor = max(1, int(chunks_per_proc))
         total_chunks = min(len(sections_info), proc_count * chunk_factor)
         ctx = get_context("spawn")
         manager = ctx.Manager()
@@ -464,6 +463,7 @@ def scrape_state(state: str, output_dir: str) -> None:
                     "",
                     progress_q,
                     record_q,
+                    threads,
                 )
                 futures.append(fut)
             # Drain per-section progress from queue while workers run
@@ -838,5 +838,23 @@ def fetch_leaf_threadsafe(
 
 
 if __name__ == "__main__":
-    # test with ND
-    scrape_state("nd", DEFAULT_DIR)
+    import argparse
+    parser = argparse.ArgumentParser(description="Scrape FindLaw codes for a given state.")
+    parser.add_argument("state", help="State abbreviation (e.g., nd, ky, pa)")
+    parser.add_argument("--output-dir", "-o", default=DEFAULT_DIR,
+                        help=f"Output directory for JSONL (default: {DEFAULT_DIR})")
+    parser.add_argument("--processes", "-p", type=int, default=6,
+                        help="Number of browser processes to use (default: 6)")
+    parser.add_argument("--threads", "-t", type=int, default=8,
+                        help="Threads per process for leaf fetches (default: 8)")
+    parser.add_argument("--chunks-per-proc", "-c", type=int, default=4,
+                        help="Work chunk factor per process for progress responsiveness (default: 4)")
+    args = parser.parse_args()
+
+    scrape_state(
+        args.state,
+        args.output_dir,
+        processes=args.processes,
+        threads=args.threads,
+        chunks_per_proc=args.chunks_per_proc,
+    )
